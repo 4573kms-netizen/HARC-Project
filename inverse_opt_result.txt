@@ -1,0 +1,4 @@
+CF4=7.50 sccm, Ar=22.50 sccm
+Depth=1380.3nm, CD_top=209.1nm, CD_mid=131.6nm, CD_bot=54.1nm
+AR=6.603, Taper=0.7411, Bowing=0.6245
+Obj.j=3.3974e-01, Evaluations=464
