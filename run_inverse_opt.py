@@ -16,6 +16,11 @@ with open(r'C:\Users\4573k\Desktop\HARC_simulation_Claude\harc_v2_calibrated_par
     params = json.load(f)
 mp = ModelParameters(**{k: v for k, v in params.items()
                          if k in ModelParameters.__dataclass_fields__})
+# New calibrated parameters (hinge-loss calibration 2026-05-21)
+mp.k_born              = 2.4170e-01
+mp.k_born_spread_left  = 2.5828e+01
+mp.k_born_spread_right = 3.8032e+00
+mp.K_dep_side          = 6.0046e-16
 
 VBIAS_FIXED = -1000.0  # 실험 조건 고정
 

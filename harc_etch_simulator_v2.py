@@ -146,6 +146,14 @@ class ModelParameters:
     # ── Lateral etch (sidewall) ───────────────────────────────────────────────
     K_lat_neu:       float = 1.5e-3    # [CAL] Chemical lateral / K_chem ratio
     K_lat_ion:       float = 1.0e-2    # [CAL] IAD ion-enhanced lateral factor
+    K_lat_sput:      float = 1.0e-14   # [CAL] Lateral physical sputtering [nm cm2 s-1]
+    #                                          Ar+ ions at grazing angle sputter the sidewall.
+    #                                          Proportional to Gamma_ion_lat × Y_s.
+    #                                          Key for Ar-rich conditions (6/24, 18/12) having
+    #                                          wider CD_bot than predicted without this term.
+    K_lat_pass:      float = 0.30      # [CAL] CFx passivation fraction in lateral etch
+    #                                          Replaces hardcoded 0.3 factor; allows optimizer
+    #                                          to balance CFx suppression of lateral etch.
 
     # ── Bohdansky sputtering ────────────────────────────────────────────────
     Q_s:             float = 0.042     # [EST] Yield coefficient
@@ -155,6 +163,9 @@ class ModelParameters:
     K_dep_poly:      float = 7.42e-15  # [CAL] CFx→polymer deposition [nm cm2 s-1]
     K_etch_poly:     float = 1.06e-16  # [CAL] Ion removal of polymer  [nm cm2 s-1]
     h_poly_char:     float = 1.0       # [CAL] Characteristic polymer thickness [nm]
+    n_poly_dep:      float = 1.0       # [CAL] Nonlinear exponent for CFx deposition
+    #                                          R_dep ∝ Gamma_CFx^n; n>1 → super-linear
+    #                                          amplifies high-CF4 polymer buildup
 
     # ── Sidewall polymer (substrate hole narrowing) ─────────────────────────
     # The substrate hole sidewall receives CFx polymer deposition.
@@ -174,7 +185,14 @@ class ModelParameters:
     # where AR_birth = depth_current / cd_mask at birth moment.
     # k_born = 0 → born at full mask width (no taper from birth)
     # k_born > 0 → taper increases with AR (physically: IAD collimation)
-    k_born:          float = 0.18      # [CAL] IAD birth-CD decay coefficient
+    k_born:              float = 0.235  # [CAL] Peak IAD birth-CD collimation coefficient
+    k_born_spread_left:  float = 17.0  # [CAL] Gaussian spread for CF4 < cf4_frac_peak
+    k_born_spread_right: float = 2.5   # [CAL] Gaussian spread for CF4 > cf4_frac_peak
+    #   Asymmetric Gaussian: k_born_eff = k_born × exp(-spread × (cf4_frac - peak)²)
+    #   Left (CF4 < peak, e.g. 6/24): spread_left steep → wider CD_born for Ar-rich
+    #   Right (CF4 > peak, e.g. 14/16, 18/12): spread_right gentle → moderate CD_born
+    #   Physical: collimation peaks at optimal IE-etch CF4/Ar; extremes less directional.
+    cf4_frac_peak:       float = 0.33  # [FIX] CF4 fraction at peak collimation (10/20 optimal)
 
     # ── Mask aperture evolution (2-D feature) ────────────────────────────────
     # dCD_mask/dt = 2*(R_lat_mask - R_poly_mask)
@@ -372,12 +390,15 @@ def calc_lateral_etch_rate(
     Sidewall (lateral) etch rate driven by:
       1. Chemical: F radicals reaching sidewall (∝ neutral flux, isotropic)
       2. Ion-enhanced lateral: IAD-angular ions hitting sidewall + F radicals
-      3. CFx passivation: reduces lateral etch
+      3. Physical sputtering: Ar+ at grazing angle (Ar-rich → wider CD_bot)
+      4. CFx passivation: reduces lateral etch (K_lat_pass now calibratable)
     """
     f_IE  = ion_enhanced_factor(E_ion, mp)
+    Y_s   = sputtering_yield(E_ion, mp)
     R_lat = (mp.K_lat_neu * mp.K_chem * Gamma_F_z
            + mp.K_lat_ion * mp.K_ie   * Gamma_F_z * Gamma_ion_lat_z * f_IE
-           - mp.K_pass * 0.3 * Gamma_CFx_z)
+           + mp.K_lat_sput             * Gamma_ion_lat_z * Y_s
+           - mp.K_pass * mp.K_lat_pass * Gamma_CFx_z)
     return np.maximum(R_lat, 0.0)
 
 
@@ -443,11 +464,14 @@ def run_forward_simulation(
         n_active = min(n_active, N_z_max - 1)
 
         if n_active > prev_n_active:
-            # Birth CD: IAD collimation narrows the effective etch width at depth.
-            # CD_born = cd_mask * exp(-k_born * AR_birth)
-            # AR_birth = depth_current / cd_mask at the moment of birth.
+            # Birth CD: asymmetric Gaussian collimation in CF4-fraction space.
+            # Separate spread left/right of cf4_frac_peak fits the non-symmetric
+            # experimental CD_bot pattern (wide-narrow-medium-wide across CF4/Ar).
+            cf4_dev_born = cond.cf4_fraction - mp.cf4_frac_peak
+            spread = mp.k_born_spread_left if cf4_dev_born < 0 else mp.k_born_spread_right
+            k_born_eff  = mp.k_born * np.exp(-spread * cf4_dev_born ** 2)
             ar_birth    = depth_current / max(cd_mask, 1.0)
-            cd_born_val = cd_mask * np.exp(-mp.k_born * ar_birth)
+            cd_born_val = cd_mask * np.exp(-k_born_eff * ar_birth)
             cd_born_val = float(np.clip(cd_born_val, 5.0, cd_mask))
             for idx in range(prev_n_active, n_active):
                 if not cd_born[idx]:
@@ -481,7 +505,11 @@ def run_forward_simulation(
         )
 
         # ── Polymer dynamics (bottom suppression) ────────────────────────────
-        R_dep_poly = mp.K_dep_poly  * Gamma_CFx_z
+        # Nonlinear deposition: R ∝ Gamma_CFx^n_poly_dep (normalized at 1e14 cm-2s-1).
+        # n>1 makes high-CF4 conditions accumulate polymer super-linearly → amplifies
+        # CD_bot spread across CF4/Ar conditions without changing linear-regime behavior.
+        _norm = np.power(np.maximum(Gamma_CFx_z / 1e14, 1e-30), mp.n_poly_dep - 1.0)
+        R_dep_poly = mp.K_dep_poly  * Gamma_CFx_z * _norm
         R_rem_poly = mp.K_etch_poly * Gamma_ion_v_z
         h_poly_full[:n_active] = np.maximum(
             h_poly_full[:n_active] + (R_dep_poly - R_rem_poly) * dt, 0.0
@@ -610,10 +638,14 @@ EXPERIMENTAL_DATA = pd.DataFrame({
 # Weights for the calibration residuals
 # AR is now primary target — depth/CD_top fitting alone does not guarantee AR accuracy
 # because small opposite-direction errors in both compound into a large AR error.
-_W_DEPTH = 1.2   # relaxed: allow ±3% depth error to let AR converge
+_W_DEPTH = 2.0   # raised: prevent birth-CD widening from blowing up depth
 _W_CDTOP = 1.0   # relaxed: mask opening is secondary to AR
-_W_CDBOT = 0.5   # unchanged: hardest to fit, kept low
+_W_CDBOT = 1.5   # raised: CD_bot fitting is a primary target
 _W_AR    = 2.5   # primary: directly penalize AR error
+# Hinge loss: extra penalty when |CD_bot error| exceeds threshold
+_W_HINGE_BOT   = 8.0   # extra weight for out-of-tolerance CD_bot
+_HINGE_THRESH  = 0.095  # starts penalising above 9.5% (target: all within 10%)
+_HINGE_SMOOTH  = 30.0   # softplus steepness (higher = sharper 10%-step)
 
 
 def _build_experiments(exp_data: pd.DataFrame):
@@ -669,24 +701,10 @@ def calibrate_model_parameters(
         #                  separate from K_dep_poly / K_etch_poly individually.
         calibrate_params = [
             # Plasma model (relative F/ion balance vs CF4 fraction)
-            'gamma_F_sat', 'beta_ion', 'alpha_cf4_ion',
-            # Vertical transport (Clausing geometric + efficiency)
-            'ion_directionality', 'clausing_exponent',
-            # Neutral transport
-            'lambda_neutral',
-            # IAD (lateral)
-            'sigma_iad',
-            # Surface reactions (rate coefficients; flux prefactors A_F, A_ion fixed)
-            'K_chem', 'K_ie', 'K_sput', 'K_pass',
-            # Lateral etch
-            'K_lat_neu', 'K_lat_ion',
-            # Polymer (bottom suppression)
-            'K_dep_poly', 'K_etch_poly',
-            # Sidewall polymer + birth CD
-            'K_dep_side', 'k_born',
-            # Mask evolution (+ F radical chemical etch of mask)
-            'K_mask_lat', 'K_mask_poly', 'K_F_mask',
-        ]   # total: 20 params — 4 exp × 4 outputs = 16 eq; bounded TRF handles over-parameterisation.
+            # Birth CD (asymmetric Gaussian) + sidewall polymer — CD_bot focused.
+            # All other params loaded from JSON (good depth/top/AR baseline).
+            'k_born', 'k_born_spread_left', 'k_born_spread_right', 'K_dep_side',
+        ]   # 4 params vs 16 eqs — well-determined, stable calibration.
 
     BOUNDS = {
         'A_F':               (1e12,  1e19),
@@ -707,11 +725,17 @@ def calibrate_model_parameters(
         'K_pass':            (1e-26, 1e-14),
         'K_lat_neu':         (1e-5,  1.0),
         'K_lat_ion':         (1e-5,  1.0),
+        'K_lat_sput':        (1e-17, 1e-11),
+        'K_lat_pass':        (0.01,  5.0),
         'K_dep_poly':        (1e-18, 1e-12),
         'K_etch_poly':       (1e-20, 1e-13),
+        'n_poly_dep':        (0.3,   4.0),
         'h_poly_char':       (0.05,  50.0),
         'K_dep_side':        (1e-19, 1e-13),
-        'k_born':            (0.01,  1.0),
+        'k_born':              (0.05,  0.6),
+        'k_born_spread_left':  (1.0,   60.0),
+        'k_born_spread_right': (0.1,   15.0),
+        'K_dep_side':          (1e-19, 1e-14),
         'Y_mask_ratio':      (0.01,  3.0),
         'K_mask_lat':        (1e-4,  5.0),
         'K_mask_poly':       (0.005, 5.0),
@@ -747,7 +771,11 @@ def calibrate_model_parameters(
                 r       = run_forward_simulation(cond_e, mp_try, verbose=False)
                 r_depth = _W_DEPTH * (r.total_depth  - meas['depth'])  / max(meas['depth'],  10.0)
                 r_top   = _W_CDTOP * (r.cd_top       - meas['cd_top']) / max(meas['cd_top'],  5.0)
-                r_bot   = _W_CDBOT * (r.cd_bot       - meas['cd_bot']) / max(meas['cd_bot'],  5.0)
+                _err_bot_raw = (r.cd_bot - meas['cd_bot']) / max(meas['cd_bot'], 5.0)
+                # Smooth hinge: softplus penalty when |error| > _HINGE_THRESH (≈9.5%)
+                _excess = (np.log1p(np.exp(_HINGE_SMOOTH * (abs(_err_bot_raw) - _HINGE_THRESH)))
+                           / _HINGE_SMOOTH)
+                r_bot   = _W_CDBOT * _err_bot_raw + _W_HINGE_BOT * _excess * np.sign(_err_bot_raw)
                 r_ar    = _W_AR    * (r.aspect_ratio  - meas['ar'])     / max(meas['ar'],      0.1)
                 residuals.extend([r_depth, r_top, r_bot, r_ar])
             except Exception as exc:
@@ -781,8 +809,8 @@ def calibrate_model_parameters(
 
     cal2 = least_squares(
         residual_fn, x0=cal1.x, bounds=bounds_log,
-        method='trf', ftol=1e-6, xtol=1e-6, gtol=1e-8,
-        max_nfev=10000, diff_step=5e-4, verbose=0,
+        method='trf', ftol=1e-8, xtol=1e-8, gtol=1e-10,
+        max_nfev=15000, diff_step=2e-4, verbose=0,
     )
 
     mp_cal = copy.deepcopy(mp_init)
@@ -1004,14 +1032,25 @@ def plot_profiles(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    import json as _json, os as _os
     print("=" * 70)
     print("  HARC ETCH SIMULATOR v2")
     print("  New models: IAD lateral flux + 2-D mask aperture evolution")
     print("  Calibration: 4-point dataset (point 5 excluded — low reliability)")
-    print("  (250W, 10mTorr, −1000V, 15°C)")
+    print("  (250W, 10mTorr, -1000V, 15C)")
     print("=" * 70)
 
-    mp_init  = ModelParameters()
+    # Warm start from JSON (good depth/top/AR), then refine birth CD + K_dep_side for CD_bot
+    mp_init = ModelParameters()
+    _json_path = 'harc_v2_calibrated_params_physics.json'
+    if _os.path.exists(_json_path):
+        with open(_json_path) as _f:
+            _d = _json.load(_f)
+        for _k, _v in _d.items():
+            if hasattr(mp_init, _k):
+                setattr(mp_init, _k, _v)
+        print(f"  Warm start: loaded {_json_path}")
+
     exp_data = EXPERIMENTAL_DATA.copy()
 
     # Point 5 (CF4=22/Ar=8) excluded from calibration; retained for validation display
@@ -1020,22 +1059,28 @@ def main():
     print("\n[STEP 1] Pre-calibration forward runs …")
     print_accuracy_table("PRE-CALIBRATION (all 5 points)", exp_data, mp_init)
 
-    print(f"\n[STEP 2] Running calibration on {len(cal_data)} reliable points …")
-    mp_cal, cal_info = calibrate_model_parameters(
+    print(f"\n[STEP 2] Running calibration pass 1 on {len(cal_data)} reliable points …")
+    mp_cal1, cal_info1 = calibrate_model_parameters(
         cal_data, mp_init, verbose=True
     )
 
+    print(f"\n[STEP 2b] Calibration pass 2 — warm restart from pass 1 …")
+    mp_cal, cal_info = calibrate_model_parameters(
+        cal_data, mp_cal1, verbose=True
+    )
+
     print("\n[STEP 3] Post-calibration accuracy (all 5 points for reference) …")
-    print_accuracy_table("POST-CALIBRATION", exp_data, mp_cal)
+    print_accuracy_table("POST-CALIBRATION PASS 1", exp_data, mp_cal1)
+    print_accuracy_table("POST-CALIBRATION PASS 2", exp_data, mp_cal)
 
     print("\n[STEP 4] Generating plots …")
     plot_calibration_comparison(
         exp_data, mp_init, mp_cal,
-        save_path='harc_v2_calibration.png'
+        save_path='figures/harc_v2_calibration.png'
     )
     plot_profiles(
         exp_data, mp_cal,
-        save_path='harc_v2_profiles.png'
+        save_path='figures/harc_v2_profiles.png'
     )
 
     print("\n[STEP 5] Calibrated ModelParameters (copy-paste to reuse):")
