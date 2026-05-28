@@ -4,15 +4,16 @@
 최적화 변수: CF4 유량만 (Ar = 30 - CF4)
 방법: 15점 그리드 서치 → Nelder-Mead 로컬 정밀화
 """
-import sys, json, warnings, time
+import sys, json, warnings, time, os
 warnings.filterwarnings('ignore')
-sys.path.insert(0, r'C:\Users\4573k\Desktop\HARC_simulation_Claude')
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
 
 import numpy as np
 from scipy.optimize import minimize
 from harc_etch_simulator_v2 import ProcessConditions, ModelParameters, run_forward_simulation
 
-with open(r'C:\Users\4573k\Desktop\HARC_simulation_Claude\harc_v2_calibrated_params_physics.json') as f:
+with open(os.path.join(_HERE, 'harc_v2_calibrated_params_physics.json')) as f:
     params = json.load(f)
 mp = ModelParameters(**{k: v for k, v in params.items()
                          if k in ModelParameters.__dataclass_fields__})
@@ -90,6 +91,6 @@ lines = [
     "=" * 60,
 ]
 print("\n" + "\n".join(lines))
-with open(r'C:\Users\4573k\Desktop\HARC_simulation_Claude\inverse_opt_result.txt', 'w', encoding='utf-8') as _f:
+with open(os.path.join(_HERE, 'inverse_opt_result.txt'), 'w', encoding='utf-8') as _f:
     _f.write("\n".join(lines) + "\n")
 print("-> 저장: inverse_opt_result.txt")

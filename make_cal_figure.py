@@ -2,7 +2,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 
-os.makedirs('figures', exist_ok=True)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+os.makedirs(os.path.join(_HERE, 'figures'), exist_ok=True)
 
 # ── Experimental values ──────────────────────────────────────────────────────
 labels    = ['6/24', '10/20', '14/16', '18/12', '22/8']
@@ -93,7 +94,7 @@ for ax, (title, meas, pre, post, errs) in zip(axes.flat, metrics):
         spine.set_edgecolor('#cccccc')
 
 plt.tight_layout()
-plt.savefig('figures/harc_v2_calibration.png', dpi=150,
-            bbox_inches='tight', facecolor='white')
-print("Saved → figures/harc_v2_calibration.png")
+_out = os.path.join(_HERE, 'figures', 'harc_v2_calibration.png')
+plt.savefig(_out, dpi=150, bbox_inches='tight', facecolor='white')
+print(f"Saved → {_out}")
 plt.show()
